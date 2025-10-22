@@ -69,8 +69,10 @@ def compile_and_run_cuda(code_path: str):
             "OMPI_MCA_plm": "isolated",
             "UCX_TLS": "cuda_copy,cuda_ipc,sm,self",
             "UCX_MEMTYPE_CACHE": "n",
-            "UCX_SOCKADDR_CM_ENABLE": "n", 
-            "UCX_NET_DEVICES": "lo", 
+            #"UCX_SOCKADDR_CM_ENABLE": "n", 
+            #"UCX_NET_DEVICES": "lo", 
+            "UCX_WARN_UNUSED_ENV_VARS": "n",
+            "UCX_LOG_LEVEL": "fatal",
             "OMPI_MCA_btl": "self,vader",
             # 单机模式配置 - 避免SSH/RSH依赖
             "OMPI_MCA_rmaps_base_mapping_policy": "slot",
