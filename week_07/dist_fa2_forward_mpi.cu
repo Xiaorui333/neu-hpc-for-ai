@@ -7,6 +7,7 @@
 #include <cmath>
 #include <algorithm>
 #include <cstring>
+#include <unistd.h>
 
 #ifndef USE_SCALE
 #define USE_SCALE 1
@@ -170,8 +171,53 @@ static void make_toy_inputs(int N, int d,
     }
 }
 
+// get local rank（compatible with Open MPI / MVAPICH2 / Slurm）
+static inline int get_local_rank_env() {
+    const char* keys[] = {
+        "OMPI_COMM_WORLD_LOCAL_RANK", // Open MPI
+        "MV2_COMM_WORLD_LOCAL_RANK",  // MVAPICH2
+        "MPI_LOCALRANKID",            // old variable
+        "SLURM_LOCALID"               // Slurm
+    };
+    for (const char* k : keys) {
+        if (const char* v = std::getenv(k)) return std::atoi(v);
+    }
+    return 0;
+}
+
+// bind GPU by local rank
+static inline void bind_gpu_by_local_rank() {
+    // to make device order stable (optional: can also be exported externally)
+    setenv("CUDA_DEVICE_ORDER", "PCI_BUS_ID", 0);
+
+    int world_rank = -1, world_size = -1;
+    CHECK_MPI(MPI_Comm_rank(MPI_COMM_WORLD, &world_rank));
+    CHECK_MPI(MPI_Comm_size(MPI_COMM_WORLD, &world_size));
+
+    int ndev = 0;
+    CHECK_CUDA(cudaGetDeviceCount(&ndev));
+    if (ndev <= 0) {
+        fprintf(stderr, "[R%d] No CUDA devices visible!\n", world_rank);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
+    const int local_rank = get_local_rank_env();
+    const int dev = local_rank % ndev;
+
+    CHECK_CUDA(cudaSetDevice(dev));
+
+    // log for checking binding relationship
+    char host[256] = {0};
+    gethostname(host, sizeof(host) - 1);
+    fprintf(stderr,
+            "[MPI %d/%d] host=%s local_rank=%d -> cudaSetDevice(%d of %d visible)\n",
+            world_rank, world_size, host, local_rank, dev, ndev);
+    fflush(stderr);
+}
+
 int main(int argc, char** argv){
     CHECK_MPI(MPI_Init(&argc, &argv));
+    bind_gpu_by_local_rank();
     int rank=0, world=1;
     CHECK_MPI(MPI_Comm_rank(MPI_COMM_WORLD, &rank));
     CHECK_MPI(MPI_Comm_size(MPI_COMM_WORLD, &world));
@@ -191,7 +237,7 @@ int main(int argc, char** argv){
     }
 
     // Map rank -> GPU
-    CHECK_CUDA(cudaSetDevice(rank));
+    // CHECK_CUDA(cudaSetDevice(rank));
 
     // ------------------ Create / scatter inputs ------------------
     std::vector<float> hQ, hK, hV;

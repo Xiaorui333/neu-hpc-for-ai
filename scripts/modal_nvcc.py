@@ -43,8 +43,8 @@ image = (
 )
 app = modal.App("nvcc")
 
-@app.function(image=image, gpu="A100-40gb:4", timeout=300)
-def compile_and_run_cuda(code_path: str):
+@app.function(image=image, gpu="A100-40gb:8", timeout=300)
+def compile_and_run_cuda(code_path: str, np: int = 4):
     import subprocess
     import os
 
@@ -114,19 +114,31 @@ def compile_and_run_cuda(code_path: str):
         # 4) 用 HPC-X 的 mpirun，且在"已加载 HPC-X 的 shell"里执行
         mpirun = f"{HPCX_DIR}/ompi/bin/mpirun"
 
-        def run_with_np(np):
-            cmd = f"source {HPCX_DIR}/hpcx-init.sh; hpcx_load; {mpirun} --mca plm isolated -np {np} --map-by slot --bind-to none ./output.bin"
-            return subprocess.run(["bash", "-lc", cmd], text=True, check=True, env=run_env)
+        desired_np = max(1, min(int(np), 8))
+        try:
+            gpus = subprocess.run(["bash", "-lc", "nvidia-smi --list-gpus | wc -l"],
+                                text=True, capture_output=True, check=True)
+            ngpus = int(gpus.stdout.strip() or "1")
+            desired_np = min(desired_np, max(1, ngpus))
+        except Exception:
+            pass
+
+        # 若未显式限定可见卡，则默认按前 N 张卡限制
+        if "CUDA_VISIBLE_DEVICES" not in run_env:
+            run_env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(desired_np))
+
 
         print("======== Running with CUDA-aware HPC-X mpirun ========")
-        for np_ranks in (4,2,1):
-            try:
-                print(f"Trying: mpirun -np {np_ranks}")
-                run_with_np(np_ranks)
-                print(f"SUCCESS with -np {np_ranks}")
-                break
-            except subprocess.CalledProcessError as e:
-                print(f"mpirun -np {np_ranks} failed: {e}")
+        print(f"Using np = {desired_np}")
+
+        # 单节点映射 & 不绑核；isolated 启动器避免 ssh/rsh；UCX 配置在环境中已给定
+        cmd = (
+            f"source {HPCX_DIR}/hpcx-init.sh; "
+            f"hpcx_load; "
+            f"{mpirun} -np {desired_np} --map-by slot --bind-to none ./output.bin"
+        )
+        subprocess.run(["bash", "-lc", cmd], text=True, check=True, env=run_env)
+        
     else:
         # Regular CUDA compilation (non-MPI)
         print("======== Compiling with NVCC (regular CUDA) ========")
