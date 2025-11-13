@@ -8,7 +8,7 @@
 - **Source Code**: [`dist_fa2_forward_mpi.cu`](./dist_fa2_forward_mpi.cu)  
 - **Run**:  
   ```bash
-  python3.11 -m modal run scripts/modal_nvcc_mpi.py \ --code-path week_07/dist_fa2_forward_mpi.cu \ --np 6
+  python3.11 -m modal run scripts/modal_nvcc_mpi.py::compile_and_run_cuda --code-path week_07/dist_fa2_forward_mpi.cu --np 6
   ```  
 
  
