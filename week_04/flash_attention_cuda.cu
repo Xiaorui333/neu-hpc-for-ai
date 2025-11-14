@@ -16,7 +16,7 @@
 
 static inline __device__ float neg_inf() { return -CUDART_INF_F; }
 
-// Forward kernel (NO MASK). One thread per row inside the Qi tile.
+// Forward kernel. One thread per row inside the Qi tile.
 __global__ void flash_attn_fwd_kernel(
     const float* __restrict__ Q,   // [N, d]
     const float* __restrict__ K,   // [N, d]
