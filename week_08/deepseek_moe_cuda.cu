@@ -280,7 +280,7 @@ __global__ void gather_expert_outputs_kernel(
     int top_k
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= batch_seq_size) return;
+    if (idx >= batch_seq_size) return;  
 
     float* out = output + idx * hidden_size;
     const int* indices = expert_indices + idx * top_k;
