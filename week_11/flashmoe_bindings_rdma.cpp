@@ -1,4 +1,5 @@
 #include <torch/extension.h>
+#include <c10/cuda/CUDAStream.h>
 #include <vector>
 #include <cuda_runtime.h>
 
@@ -50,8 +51,8 @@ torch::Tensor flashmoe_rdma_forward_py(
     // Allocate output tensor
     auto output = torch::empty_like(hidden_states);
     
-    // Get CUDA stream (use default stream for simplicity)
-    cudaStream_t stream = 0;
+    // Get current CUDA stream from PyTorch (avoid conflicts with default stream)
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(device_id);
     
     // Call CUDA kernel
     flashmoe_rdma_forward(
