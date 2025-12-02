@@ -45,6 +45,7 @@ if USE_NVSHMEM_FLAG:
 if USE_NVSHMEM_FLAG:
     libraries = [
         "nvshmem_host",  # 主要的 NVSHMEM 动态库
+        "mpi",  # MPI library for nvshmemx_init_attr with MPI_COMM_WORLD
     ]
     # 如果存在 libnvshmem.so，也链接它
     nvshmem_so = os.path.join(NVSHMEM_HOME, "lib", "libnvshmem.so")
@@ -129,7 +130,7 @@ ext = ce.CUDAExtension(
     name="flashmoe_rdma_cuda",
     sources=[
         "flashmoe_bindings_rdma.cpp",
-        "flashmoe_kernel_no_nvshmem.cu",  # Full structure, NVSHMEM optional
+        "flashmoe_kernel.cu",  # Full structure, NVSHMEM optional
     ],
     include_dirs=include_dirs,
     library_dirs=library_dirs,

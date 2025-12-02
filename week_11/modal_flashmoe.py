@@ -20,10 +20,11 @@ app = modal.App("flashmoe-rdma")
 # Modal Image
 # =============================================================================
 # 说明：
-# - 选用 nvidia/cuda:12.1.0-devel-ubuntu22.04 与 torch cu121 对齐
+# - 选用 nvidia/cuda:12.1.1-devel-ubuntu22.04 与 torch cu121 对齐（避免弃用警告）
 # - 预装构建依赖，NVSHMEM 在运行期安装（更灵活）
+# - 包含 OpenMPI + PMIx + UCX 以支持 nvshmrun 多 PE 启动
 flashmoe_image = (
-    modal.Image.from_registry("nvidia/cuda:12.1.0-devel-ubuntu22.04", add_python="3.11")
+    modal.Image.from_registry("nvidia/cuda:12.1.1-devel-ubuntu22.04", add_python="3.11")
     .apt_install(
         "build-essential",
         "git",
@@ -40,6 +41,13 @@ flashmoe_image = (
         "ninja-build",
         "python3-dev",
         "patchelf",
+        # Multi-PE launcher support (nvshmrun)
+        "openmpi-bin",
+        "libopenmpi-dev",
+        "libpmix-dev",
+        "libevent-dev",
+        "libucx0",  # UCX library (Ubuntu 22.04 package name)
+        "libucx-dev",  # UCX development headers
     )
     .pip_install(
         "torch==2.4.1+cu121",
@@ -50,7 +58,7 @@ flashmoe_image = (
         {
             "CUDA_HOME": "/usr/local/cuda",
             "NVSHMEM_HOME": "/usr/local/nvshmem",
-            "NVSHMEM_SYMMETRIC_SIZE": "512M",
+            "NVSHMEM_SYMMETRIC_SIZE": "768M",  # Increased for multi-PE
             # A100/H100 默认架构（可被外部覆盖）
             "TORCH_CUDA_ARCH_LIST": "8.0;9.0",
         }
@@ -95,42 +103,8 @@ def install_nvshmem():
         print("✓ NVSHMEM already installed")
         return True
 
-    print("Installing NVSHMEM 2.9.0-2...")
-
-    # ---- Method 1: Binary for Ubuntu 22.04 + CUDA 12.1
-    print("\n[Method 1] Trying pre-compiled binary (CUDA 12.1)...")
-    binary_url = (
-        "https://developer.download.nvidia.com/compute/redist/nvshmem/2.9.0/"
-        "builds/cuda12.1/txz/ubuntu22_04/x64/libnvshmem_2.9.0-2+cuda12.1_amd64.txz"
-    )
-
-    r = _run(
-        f"bash -lc 'curl -L -s --fail {binary_url} -o /tmp/nvshmem_binary.txz'",
-        timeout=120,
-    )
-    if r.returncode == 0 and os.path.exists("/tmp/nvshmem_binary.txz"):
-        print("  ✓ Downloaded binary txz")
-        _run("bash -lc 'mkdir -p /tmp/nvshmem_extract && tar -xf /tmp/nvshmem_binary.txz -C /tmp/nvshmem_extract'")
-        # Try install into /usr/local/nvshmem
-        _run("bash -lc 'mkdir -p /usr/local/nvshmem'")
-        # Attempt common layouts
-        attempts = [
-            "test -d /tmp/nvshmem_extract/lib && cp -r /tmp/nvshmem_extract/* /usr/local/nvshmem/",
-            "DIR=$(find /tmp/nvshmem_extract -type f -name libnvshmem.so -print -quit | xargs dirname | xargs dirname); "
-            "cp -r $DIR/* /usr/local/nvshmem/",
-        ]
-        for i, cmd in enumerate(attempts, 1):
-            _run(f"bash -lc '{cmd}'")
-            if os.path.exists("/usr/local/nvshmem/lib/libnvshmem.so"):
-                print(f"  ✓ Installed from binary (method {i})")
-                print("✓ NVSHMEM installed from binary")
-                return True
-        print("  ✗ Binary extraction layout not recognized")
-
-    print("  ✗ Binary installation failed; fallback to source...")
-
-    # ---- Method 2: Build from source (reduced build set)
-    print("\n[Method 2] Building from source (this takes several minutes)...")
+    print("Installing NVSHMEM 2.9.0-2 from source...")
+    print("(This takes several minutes)")
     source_url = (
         "https://developer.download.nvidia.com/compute/redist/nvshmem/2.9.0/"
         "source/nvshmem_src_2.9.0-2.txz"
@@ -147,22 +121,160 @@ def install_nvshmem():
     _run("bash -lc 'tar -xf /tmp/nvshmem_src.txz -C /tmp'")
     print("  ✓ Source unpacked")
 
-    # Speed up: skip examples/tests/MPI; increase timeout
-    build_cmd = dedent(
+    # Build with MPI/SHMEM support to enable nvshmrun launcher
+    # Auto-detect MPI prefix and pass to NVSHMEM Makefile
+    build_script = dedent(
         """
-        cd /tmp/nvshmem_src_2.9.0-2 && \
-        make -j"$(nproc)" install PREFIX=/usr/local/nvshmem \
+        #!/bin/bash
+        set -e
+        cd /tmp/nvshmem_src_2.9.0-2
+        
+        # Auto-detect MPI prefix from mpicc location
+        MPICC=$(which mpicc || echo "")
+        if [ -z "$MPICC" ]; then
+            echo "Error: mpicc not found. Install openmpi-bin and libopenmpi-dev."
+            exit 1
+        fi
+        
+        # Extract MPI prefix (root directory containing bin/mpicc)
+        MPI_PREFIX=""
+        
+        # Method 1: From mpicc path (most reliable for system packages)
+        # /usr/bin/mpicc -> /usr
+        # /usr/local/bin/mpicc -> /usr/local
+        MPICC_DIR=$(dirname "$MPICC")
+        if [ "$MPICC_DIR" = "/usr/bin" ]; then
+            MPI_PREFIX="/usr"
+        elif [ "$MPICC_DIR" = "/usr/local/bin" ]; then
+            MPI_PREFIX="/usr/local"
+        else
+            # Extract parent of bin directory
+            MPI_PREFIX=$(dirname "$MPICC_DIR")
+        fi
+        
+        # Method 2: Verify by checking if bin/mpicc exists at prefix
+        if [ -n "$MPI_PREFIX" ] && [ ! -f "$MPI_PREFIX/bin/mpicc" ]; then
+            # Try to find the actual root
+            # For Ubuntu: mpicc might be in /usr/bin, but MPI libs in /usr/lib/x86_64-linux-gnu/openmpi
+            # The prefix should still be /usr
+            if [ -f "/usr/bin/mpicc" ]; then
+                MPI_PREFIX="/usr"
+            elif [ -f "/usr/local/bin/mpicc" ]; then
+                MPI_PREFIX="/usr/local"
+            fi
+        fi
+        
+        # Method 3: Use mpicc --showme to verify (but extract root, not subdir)
+        if [ -z "$MPI_PREFIX" ] || [ ! -d "$MPI_PREFIX" ]; then
+            MPI_INCLUDE=$(mpicc --showme:compile 2>/dev/null | tr ' ' '\\n' | grep '^-I' | head -1 | sed 's/^-I//' || echo "")
+            if [ -n "$MPI_INCLUDE" ]; then
+                # Extract root: /usr/include/openmpi -> /usr
+                # /usr/lib/x86_64-linux-gnu/openmpi/include -> /usr
+                if [[ "$MPI_INCLUDE" == "/usr"* ]]; then
+                    MPI_PREFIX="/usr"
+                elif [[ "$MPI_INCLUDE" == "/usr/local"* ]]; then
+                    MPI_PREFIX="/usr/local"
+                fi
+            fi
+        fi
+        
+        # Final check: ensure prefix is valid
+        if [ -z "$MPI_PREFIX" ] || [ ! -d "$MPI_PREFIX" ]; then
+            echo "Error: Could not detect MPI prefix from mpicc: $MPICC"
+            exit 1
+        fi
+        
+        echo "Detected MPI prefix: $MPI_PREFIX"
+        echo "mpicc location: $MPICC"
+        
+        # NVSHMEM Makefile expects /usr/local/ompi structure
+        # Create complete symlink structure to match Makefile expectations
+        mkdir -p /usr/local/ompi/{bin,include,lib}
+        
+        # Link MPI compilers
+        if [ ! -e /usr/local/ompi/bin/mpicc ]; then
+            ln -sf "$MPICC" /usr/local/ompi/bin/mpicc
+            echo "Created symlink: /usr/local/ompi/bin/mpicc -> $MPICC"
+        fi
+        
+        MPICXX=$(which mpicxx || which mpic++ || echo "")
+        if [ -n "$MPICXX" ] && [ ! -e /usr/local/ompi/bin/mpicxx ]; then
+            ln -sf "$MPICXX" /usr/local/ompi/bin/mpicxx
+            echo "Created symlink: /usr/local/ompi/bin/mpicxx -> $MPICXX"
+        fi
+        
+        # Check for oshcc (OpenSHMEM compiler) - required for NVSHMEM_SHMEM_SUPPORT
+        OSHCC=$(which oshcc || echo "")
+        ENABLE_SHMEM=1
+        if [ -n "$OSHCC" ] && [ ! -e /usr/local/ompi/bin/oshcc ]; then
+            ln -sf "$OSHCC" /usr/local/ompi/bin/oshcc
+            echo "Created symlink: /usr/local/ompi/bin/oshcc -> $OSHCC"
+        elif [ -z "$OSHCC" ]; then
+            # oshcc not found - disable SHMEM support (we mainly need MPI for nvshmrun)
+            echo "Warning: oshcc not found, disabling NVSHMEM_SHMEM_SUPPORT"
+            echo "  (MPI support is sufficient for nvshmrun multi-GPU execution)"
+            ENABLE_SHMEM=0
+        fi
+        
+        # Link MPI headers (if they exist)
+        for mpi_inc in /usr/include/openmpi /usr/lib/x86_64-linux-gnu/openmpi/include; do
+            if [ -d "$mpi_inc" ]; then
+                # Create symlinks for each header file
+                find "$mpi_inc" -maxdepth 1 -type f -name "*.h" -exec ln -sf {} /usr/local/ompi/include/ \\; 2>/dev/null || true
+                # Also link subdirectories if any
+                find "$mpi_inc" -maxdepth 1 -type d ! -path "$mpi_inc" -exec ln -sf {} /usr/local/ompi/include/ \\; 2>/dev/null || true
+                break
+            fi
+        done
+        
+        # Link MPI libraries (if they exist)
+        for mpi_lib in /usr/lib/x86_64-linux-gnu/openmpi /usr/lib/openmpi; do
+            if [ -d "$mpi_lib" ]; then
+                find "$mpi_lib" -maxdepth 1 -type f -name "*.so*" -exec ln -sf {} /usr/local/ompi/lib/ \\; 2>/dev/null || true
+                break
+            fi
+        done
+        
+        echo "MPI symlink structure created at /usr/local/ompi"
+        
+        # Build NVSHMEM
+        # Strategy: Use /usr/local/ompi as MPI_HOME (where we created symlinks)
+        # This ensures Makefile finds mpicc at the expected location
+        export PATH="/usr/local/ompi/bin:$MPI_PREFIX/bin:$PATH"
+        export MPICC="/usr/local/ompi/bin/mpicc"
+        if [ -n "$MPICXX" ]; then
+            export MPICXX="/usr/local/ompi/bin/mpicxx"
+        fi
+        
+        # Build NVSHMEM - conditionally enable SHMEM support
+        BUILD_CMD="make -j$(nproc) install PREFIX=/usr/local/nvshmem \
             NVSHMEM_BUILD_IBGDA=1 \
             NVSHMEM_ENABLE_ALL_DEVICE_INLINING=1 \
             NVSHMEM_USE_GDRCOPY=0 \
-            NVSHMEM_MPI_SUPPORT=0 \
-            NVSHMEM_SHMEM_SUPPORT=0 \
+            NVSHMEM_MPI_SUPPORT=1 \
             NVSHMEM_BUILD_EXAMPLES=0 \
-            NVSHMEM_BUILD_TESTS=0
+            NVSHMEM_BUILD_TESTS=0 \
+            MPI_HOME=\"/usr/local/ompi\" \
+            OMPI_HOME=\"/usr/local/ompi\" \
+            MPICC=\"/usr/local/ompi/bin/mpicc\""
+        
+        if [ "$ENABLE_SHMEM" = "1" ]; then
+            BUILD_CMD="$BUILD_CMD NVSHMEM_SHMEM_SUPPORT=1"
+            echo "Building with SHMEM support enabled"
+        else
+            BUILD_CMD="$BUILD_CMD NVSHMEM_SHMEM_SUPPORT=0"
+            echo "Building with SHMEM support disabled (MPI only)"
+        fi
+        
+        # Execute build command
+        eval $BUILD_CMD
         """
     ).strip()
-
-    r = _run(f"bash -lc '{build_cmd}'", timeout=1800)  # up to 30 minutes just in case
+    
+    with open("/tmp/nvshmem_build.sh", "w") as f:
+        f.write(build_script)
+    
+    r = _run("bash /tmp/nvshmem_build.sh", timeout=1800)  # up to 30 minutes just in case
     if r.returncode == 0:
         # Verify installation
         check_result = _run("bash -lc 'ls -la /usr/local/nvshmem/lib* 2>/dev/null | head -20'", timeout=10)
@@ -176,20 +288,100 @@ def install_nvshmem():
         post_fix = _run(
             "bash -lc '"
             "mkdir -p /usr/local/nvshmem/bin && "
-            # 从源码树查找并复制 nvshmrun
-            "NVSHMRUN=$(find /tmp/nvshmem_src_2.9.0-2 -name nvshmrun -type f 2>/dev/null | head -1) && "
-            "if [ -n \"$NVSHMRUN\" ]; then cp \"$NVSHMRUN\" /usr/local/nvshmem/bin/ && chmod +x /usr/local/nvshmem/bin/nvshmrun && echo \"    ✓ nvshmrun installed\"; "
-            "else echo \"    (nvshmrun not found in source tree)\"; fi && "
+            # 从多个位置查找 nvshmrun: 源码树、构建目录、安装目录
+            "NVSHMRUN=\"\" && "
+            "for loc in /tmp/nvshmem_src_2.9.0-2/src/launch/nvshmrun "
+            "/tmp/nvshmem_src_2.9.0-2/build/bin/nvshmrun "
+            "/tmp/nvshmem_src_2.9.0-2/usr/bin/nvshmrun "
+            "/usr/local/nvshmem/bin/nvshmrun "
+            "$(find /tmp/nvshmem_src_2.9.0-2 -name nvshmrun -type f 2>/dev/null | head -1); "
+            "do "
+            "  if [ -f \"$loc\" ] && [ -x \"$loc\" ]; then "
+            "    NVSHMRUN=\"$loc\"; break; "
+            "  fi; "
+            "done && "
+            # 如果找到，复制到安装目录
+            "if [ -n \"$NVSHMRUN\" ]; then "
+            "  cp \"$NVSHMRUN\" /usr/local/nvshmem/bin/ && "
+            "  chmod +x /usr/local/nvshmem/bin/nvshmrun && "
+            "  echo \"    ✓ nvshmrun installed from $NVSHMRUN\"; "
+            "else "
+            "  echo \"    (nvshmrun not found - creating wrapper script)\"; "
+            "fi"
+            "'",
+            timeout=30
+        )
+        
+        # If nvshmrun not found, create a wrapper script using Python
+        nvshmrun_wrapper_check = _run(
+            "bash -lc 'test -x /usr/local/nvshmem/bin/nvshmrun && echo FOUND || echo MISS'",
+            timeout=5
+        )
+        if "MISS" in (nvshmrun_wrapper_check.stdout or ""):
+            print("  Creating nvshmrun wrapper script...")
+            wrapper_script = """#!/bin/bash
+# NVSHMEM launcher wrapper (using mpirun)
+# This is a fallback wrapper when nvshmrun is not available in the NVSHMEM build
+
+export NVSHMEM_SYMMETRIC_SIZE=${NVSHMEM_SYMMETRIC_SIZE:-512M}
+export LD_LIBRARY_PATH=/usr/local/nvshmem/lib:/usr/local/nvshmem/lib64:$LD_LIBRARY_PATH
+
+# Parse nvshmrun-style arguments: -np N --ppn M command args...
+NP=""
+PPN=""
+ARGS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -np)
+            NP="$2"
+            shift 2
+            ;;
+        --ppn)
+            PPN="$2"
+            shift 2
+            ;;
+        *)
+            ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# Use mpirun with parsed arguments
+if [ -n "$NP" ]; then
+    exec mpirun -np "$NP" "${ARGS[@]}"
+else
+    exec mpirun "${ARGS[@]}"
+fi
+"""
+            with open("/tmp/nvshmrun_wrapper.sh", "w") as f:
+                f.write(wrapper_script)
+            _run(
+                "bash -lc 'cp /tmp/nvshmrun_wrapper.sh /usr/local/nvshmem/bin/nvshmrun && chmod +x /usr/local/nvshmem/bin/nvshmrun && echo \"    ✓ nvshmrun wrapper created\"'",
+                timeout=10
+            )
+        
+        # Continue with other post-install fixes
+        post_fix2 = _run(
+            "bash -lc '"
             # 创建 libnvshmem.so 兼容软链（如果只有 _host 版本）
             "cd /usr/local/nvshmem/lib && "
             "if [ ! -f libnvshmem.so ] && [ -f libnvshmem_host.so ]; then ln -sf libnvshmem_host.so libnvshmem.so && echo \"    ✓ libnvshmem.so -> libnvshmem_host.so\"; fi && "
             # 创建 lib64 -> lib 软链
             "cd /usr/local/nvshmem && if [ ! -e lib64 ]; then ln -sf lib lib64 && echo \"    ✓ lib64 -> lib\"; fi"
             "'",
-            timeout=30
+            timeout=10
         )
+        if post_fix2.stdout:
+            print(post_fix2.stdout)
+        
         if post_fix.stdout:
             print(post_fix.stdout)
+        
+        # Verify nvshmrun installation
+        nvshmrun_check = _run("bash -lc 'test -x /usr/local/nvshmem/bin/nvshmrun && echo nvshmrun:OK || echo nvshmrun:MISS'", timeout=10)
+        if nvshmrun_check.stdout:
+            print(f"  {nvshmrun_check.stdout.strip()}")
         
         print("✓ NVSHMEM installed from source")
         return True
@@ -401,7 +593,7 @@ def run():
     Multi-GPU test: Full Paper-aligned RDMA with 2 GPUs.
     """
     os.chdir("/root/flashmoe")
-    os.environ["NVSHMEM_SYMMETRIC_SIZE"] = "512M"
+    os.environ["NVSHMEM_SYMMETRIC_SIZE"] = "768M"  # Increased for multi-PE
 
     print("=" * 80)
     print("FlashMoE RDMA - MULTI-GPU (Full Paper Alignment)")
@@ -450,19 +642,23 @@ def run():
         print("Multi-GPU NVSHMEM Test")
         print("=" * 80)
         
+        # Get MPI rank (will correspond to PE ID after nvshmemx_init_attr)
+        # PE information is set during kernel initialization via nvshmemx_init_attr
+        # Use OpenMPI environment variables (mpi4py not installed in image)
+        my_rank = int(os.environ.get("OMPI_COMM_WORLD_RANK", "0"))
+        n_ranks = int(os.environ.get("OMPI_COMM_WORLD_SIZE", "1"))
+        
         # Check available GPUs
         n_gpus = torch.cuda.device_count()
-        print(f"\nAvailable GPUs: {n_gpus}")
+        print(f"\nMPI Rank: {my_rank}/{n_ranks} (will become PE {my_rank}/{n_ranks} after NVSHMEM init)")
+        print(f"Available GPUs: {n_gpus}")
         for i in range(n_gpus):
             print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
         
-        if n_gpus < 2:
-            print("\n⚠ Need 2+ GPUs for multi-GPU RDMA test")
-            print("  Running single-GPU version instead...")
-            device_id = 0
-        else:
-            print(f"\n✓ Using {n_gpus} GPUs for FlashMoE RDMA")
-            device_id = 0  # Will use all GPUs via NVSHMEM
+        # Use MPI rank as device ID (one PE per GPU)
+        # Kernel will set device via cudaSetDevice(mype_node) during init
+        device_id = my_rank % n_gpus
+        print(f"\n✓ Rank {my_rank} will use GPU {device_id} for FlashMoE RDMA")
         
         print()
         
@@ -481,15 +677,15 @@ def run():
         # Create test tensors
         batch_size, seq_len, hidden_dim = 8, 256, 1024
         num_experts, intermediate_dim = 16, 4096
-        num_devices = min(n_gpus, 2)  # Use up to 2 GPUs
+        num_devices = n_ranks  # Use actual number of MPI ranks (PEs)
         top_k = 2
         
         device = torch.device(f"cuda:{device_id}")
         
-        print(f"Test configuration:")
+        print(f"\nTest configuration:")
         print(f"  Batch: {batch_size}, Seq: {seq_len}, Hidden: {hidden_dim}")
         print(f"  Experts: {num_experts}, Top-K: {top_k}")
-        print(f"  Devices: {num_devices}")
+        print(f"  PEs: {n_ranks}, Devices: {num_devices}, Rank {my_rank} on GPU {device_id}")
         print()
         
         # Input tensors
@@ -506,14 +702,15 @@ def run():
                 expert_gate, expert_up, expert_down,
                 top_k, num_experts, num_devices
             )
-            print("✓ Multi-GPU RDMA kernel executed successfully!")
+            print(f"✓ Rank {my_rank} (PE {my_rank}): Multi-GPU RDMA kernel executed successfully!")
             print(f"  Output shape: {output.shape}")
             print(f"  Output dtype: {output.dtype}")
             print(f"  Output device: {output.device}")
             print()
-            print("=" * 80)
-            print("✅ Full Paper-Aligned FlashMoE with NVSHMEM RDMA")
-            print("=" * 80)
+            if my_rank == 0:  # Only print once from Rank 0 (PE 0)
+                print("=" * 80)
+                print("✅ Full Paper-Aligned FlashMoE with NVSHMEM RDMA (Multi-PE)")
+                print("=" * 80)
         except Exception as e:
             print(f"✗ Kernel execution failed: {e}")
             import traceback
@@ -529,28 +726,59 @@ def run():
     n_gpus = int(gpu_count_check.stdout.strip()) if gpu_count_check.returncode == 0 else 1
     
     print(f"Detected {n_gpus} GPU(s) via PyTorch")
-    
-    # Check if nvshmrun is available
-    nvshmrun_check = _run("bash -c 'test -x /usr/local/nvshmem/bin/nvshmrun || which nvshmrun'", timeout=5)
-    has_nvshmrun = nvshmrun_check.returncode == 0
-    print(f"nvshmrun available: {'✓' if has_nvshmrun else '✗'}")
     print()
     
-    # Environment setup
-    env_setup = (
-        "export LD_LIBRARY_PATH=/usr/local/nvshmem/lib:/usr/local/nvshmem/lib64:$LD_LIBRARY_PATH && "
-        "export PATH=/usr/local/nvshmem/bin:$PATH"
-    )
+    # NVSHMEM environment variables (best practices)
+    nvshmem_home = "/usr/local/nvshmem"
+    nvshmem_symmetric_size = "768M"
     
-    if n_gpus >= 2 and has_nvshmrun:
-        print("Using nvshmrun for multi-GPU NVSHMEM execution...")
-        cmd = f"{env_setup} && nvshmrun -np {min(n_gpus, 2)} python /tmp/test_multi_gpu.py"
+    # Set OpenMPI allow root execution (required for Modal root user)
+    os.environ["OMPI_ALLOW_RUN_AS_ROOT"] = "1"
+    os.environ["OMPI_ALLOW_RUN_AS_ROOT_CONFIRM"] = "1"
+    
+    # Use mpirun directly (nvshmemx_init_attr with MPI_COMM_WORLD handles PE initialization)
+    # OpenMPI automatically sets OMPI_COMM_WORLD_LOCAL_RANK for strict PE-GPU binding
+    if n_gpus >= 2:
+        np = min(n_gpus, 2)
+        print(f"Using mpirun for multi-PE execution ({np} PEs, one per GPU)...")
+        print("  (nvshmemx_init_attr with MPI_COMM_WORLD will create PE: 0/2, 1/2)")
+        print("  (OMPI_COMM_WORLD_LOCAL_RANK will be auto-set by mpirun for strict PE-GPU binding)")
+        
+        # Build CUDA_VISIBLE_DEVICES list (0,1 for 2 GPUs)
+        cuda_visible = ",".join(str(i) for i in range(np))
+        
+        # Build LD_LIBRARY_PATH in parent process (expand $LD_LIBRARY_PATH first)
+        current_ld_path = os.environ.get("LD_LIBRARY_PATH", "")
+        ld_library_path = f"{nvshmem_home}/lib:{nvshmem_home}/lib64"
+        if current_ld_path:
+            ld_library_path = f"{ld_library_path}:{current_ld_path}"
+        
+        # Use mpirun with proper environment variable passing
+        # --bind-to none: allow processes to use different CPUs/GPUs
+        # -x: pass environment variables to MPI processes (does NOT expand $VAR)
+        # --allow-run-as-root: explicit flag (double insurance)
+        cmd = (
+            f"mpirun -np {np} --bind-to none --allow-run-as-root "
+            f"-x OMPI_ALLOW_RUN_AS_ROOT=1 "
+            f"-x OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 "
+            f"-x NVSHMEM_HOME={nvshmem_home} "
+            f"-x LD_LIBRARY_PATH={ld_library_path} "
+            f"-x NVSHMEM_BOOTSTRAP=MPI "
+            f"-x NVSHMEM_SYMMETRIC_SIZE={nvshmem_symmetric_size} "
+            f"-x NVSHMEM_UCX_TLS=rc,sm,cuda_copy,cuda_ipc "
+            f"-x CUDA_VISIBLE_DEVICES={cuda_visible} "
+            f"python /tmp/test_multi_gpu.py"
+        )
     else:
-        if n_gpus >= 2:
-            print("⚠ nvshmrun not available, running in single-process mode...")
-            print("  (NVSHMEM device calls will still work, but no multi-process coordination)")
-        else:
-            print("Single GPU detected, running without nvshmrun...")
+        print("Single GPU detected, running without mpirun...")
+        # Single GPU: set environment variables directly
+        env_setup = (
+            f"export NVSHMEM_HOME={nvshmem_home} && "
+            f"export LD_LIBRARY_PATH={nvshmem_home}/lib:{nvshmem_home}/lib64:$LD_LIBRARY_PATH && "
+            f"export NVSHMEM_BOOTSTRAP=MPI && "
+            f"export NVSHMEM_SYMMETRIC_SIZE={nvshmem_symmetric_size} && "
+            f"export NVSHMEM_UCX_TLS=rc,sm,cuda_copy,cuda_ipc"
+        )
         cmd = f"{env_setup} && python /tmp/test_multi_gpu.py"
     
     r = _run(f"bash -lc '{cmd}'", timeout=1200)
