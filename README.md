@@ -1,4 +1,4 @@
-# HPC for AI — Course Portfolio
+# HPC for AI — Portfolio
 
 ![CUDA](https://img.shields.io/badge/CUDA-12.x-76B900?logo=nvidia)
 ![C](https://img.shields.io/badge/C-00599C?logo=c)
@@ -7,7 +7,6 @@
 ![MPI](https://img.shields.io/badge/MPI-HPC--X-blue)
 ![Modal](https://img.shields.io/badge/Cloud-Modal-black)
 
-## The Story
 
 Modern large language models like GPT-4, LLaMA, and DeepSeek-V3 owe their speed not just to bigger GPUs, but to a handful of carefully engineered kernels — FlashAttention, tiled GEMM, Mixture-of-Experts — running across dozens of devices connected by high-speed networks.
 
